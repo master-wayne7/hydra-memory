@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HydraMemory</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2e38;
+    --text: #e6e8ec;
+    --muted: #8b93a3;
+    --accent: #5b8def;
+    --found: #3ec97a;
+    --notfound: #e0574a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 48px 16px;
+  }
+  main {
+    width: 100%;
+    max-width: 640px;
+  }
+  h1 {
+    font-size: 1.4rem;
+    margin: 0 0 4px;
+  }
+  p.subtitle {
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 0.9rem;
+  }
+  form {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 24px;
+  }
+  input[type="text"] {
+    flex: 1;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    font-size: 0.95rem;
+  }
+  input[type="text"]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
+  button {
+    padding: 12px 18px;
+    border-radius: 8px;
+    border: none;
+    background: var(--accent);
+    color: white;
+    font-size: 0.95rem;
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .card {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 18px 20px;
+    display: none;
+  }
+  .card.visible { display: block; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border-radius: 999px;
+    margin-bottom: 12px;
+  }
+  .status.found { color: var(--found); background: rgba(62, 201, 122, 0.12); }
+  .status.notfound { color: var(--notfound); background: rgba(224, 87, 74, 0.12); }
+  .answer {
+    font-size: 1.05rem;
+    line-height: 1.5;
+    margin: 0 0 12px;
+  }
+  .sources {
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .sources code {
+    background: rgba(255,255,255,0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .examples {
+    margin-top: 28px;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .examples button {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    border-radius: 6px;
+    margin: 4px 6px 0 0;
+  }
+  .examples button:hover {
+    color: var(--text);
+    border-color: var(--accent);
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>HydraMemory</h1>
+  <p class="subtitle">Ask about the user's memory. Answers are traced back to the exact session, and superseded facts never win over the current one.</p>
+
+  <form id="ask-form">
+    <input type="text" id="question" placeholder="e.g. Where does the user currently live?" autocomplete="off">
+    <button type="submit" id="submit-btn">Ask</button>
+  </form>
+
+  <div class="card" id="result-card">
+    <span class="status" id="status-badge"></span>
+    <p class="answer" id="answer-text"></p>
+    <p class="sources" id="sources-text"></p>
+  </div>
+
+  <div class="examples">
+    Try:
+    <button data-q="Where does the user currently live?">Where does the user live?</button>
+    <button data-q="What is the user's favorite food?">Favorite food?</button>
+    <button data-q="What are the user's travel plans?">Travel plans?</button>
+    <button data-q="What is the user's favorite color?">Favorite color? (unanswerable)</button>
+  </div>
+</main>
+
+<script>
+  const API_URL = "http://127.0.0.1:5000/ask";
+
+  const form = document.getElementById("ask-form");
+  const input = document.getElementById("question");
+  const submitBtn = document.getElementById("submit-btn");
+  const card = document.getElementById("result-card");
+  const badge = document.getElementById("status-badge");
+  const answerText = document.getElementById("answer-text");
+  const sourcesText = document.getElementById("sources-text");
+
+  async function ask(question) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Asking...";
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      const data = await res.json();
+
+      card.classList.add("visible");
+      if (data.found) {
+        badge.textContent = "found";
+        badge.className = "status found";
+      } else {
+        badge.textContent = "not in memory";
+        badge.className = "status notfound";
+      }
+      answerText.textContent = data.answer || "(no answer)";
+      sourcesText.textContent = data.source_sessions && data.source_sessions.length
+        ? "Source: " + data.source_sessions.map(s => s).join(", ")
+        : "No source session (abstained).";
+    } catch (err) {
+      card.classList.add("visible");
+      badge.textContent = "error";
+      badge.className = "status notfound";
+      answerText.textContent = "Could not reach the API. Is it running on " + API_URL + "?";
+      sourcesText.textContent = "";
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Ask";
+    }
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const q = input.value.trim();
+    if (q) ask(q);
+  });
+
+  document.querySelectorAll(".examples button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      input.value = btn.dataset.q;
+      ask(btn.dataset.q);
+    });
+  });
+</script>
+</body>
+</html>

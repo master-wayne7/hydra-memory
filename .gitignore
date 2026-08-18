@@ -1,0 +1,10 @@
+.env
+hydradb-data/
+__pycache__/
+*.pyc
+venv/
+.venv/
+.claude/
+eval/data/longmemeval_s_cleaned.json
+eval/data/longmemeval_oracle.json
+PROJECT_CONTEXT.md

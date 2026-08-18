@@ -1,0 +1,188 @@
+# HydraMemory
+
+An AI agent memory layer built on [HydraDB](https://github.com/hydra-db/hydradb), a graph
+database. Built for the Hack Hydra hackathon, Track 03: Memory and Context Retrieval.
+
+HydraMemory demonstrates two things a vector store structurally can't do well, using a graph
+instead:
+
+1. **Track chronology and overwritten facts.** If a user says "I live in Delhi" in one session
+   and "I moved to Pune" weeks later, the graph holds an explicit `SUPERSEDES` edge between the
+   two facts, so a query always returns the *current* one — not whichever is closest by
+   embedding similarity.
+2. **Abstain correctly.** If a question's answer was never stated in any session, the system
+   says "I don't have that in memory" instead of letting an LLM guess from the nearest match.
+
+This is a small, hand-crafted demo (9 synthetic chat sessions, one shared graph), not a
+benchmark run — the goal is a legible, convincing proof of the two properties above.
+
+## How it works
+
+```
+data/sessions.json  --(Groq extraction)-->  ingest/ingest.py  --(writes)-->  HydraDB
+                                                                                  |
+ui/index.html  <--(JSON)--  api/app.py  --(Cypher query + Groq phrasing)--------+
+```
+
+**Schema:**
+
+```
+(:Session {id, key, index, date})
+(:Fact {id, key, subject, predicate, object, text, timestamp, current})
+
+(:Fact)-[:STATED_IN]->(:Session)
+(:Fact)-[:SUPERSEDES]->(:Fact)     -- newer fact points at the one it overwrites
+```
+
+Every `Fact` carries a `current: true/false` flag. When ingestion sees a new fact whose
+`(subject, predicate)` already has a current fact with a *different* value, it writes the new
+fact, links it `-[:SUPERSEDES]->` the old one, and flips the old fact's `current` to `false` —
+all via real Cypher queries against the live graph, not in-memory bookkeeping in the ingestion
+script. Retrieval is then a single, trivially correct query:
+
+```cypher
+MATCH (f:Fact {subject: $s, predicate: $p, current: true})-[:STATED_IN]->(sess:Session)
+RETURN f.text, f.object, sess.key, sess.date
+```
+
+Zero rows back means the graph has no current fact for that predicate — that's the abstention
+signal the `/ask` endpoint acts on, before any LLM gets a chance to synthesize an answer.
+
+## Real HydraDB behavior vs. the docs
+
+While building this, direct testing against a running HydraDB node (not just its README)
+turned up several load-bearing constraints worth documenting for anyone else building on it:
+
+- **The Python `neo4j` Bolt driver refuses to connect at all.** It hard-rejects any server whose
+  agent string doesn't start with `"Neo4j/"` — HydraDB reports `"SlateDBGraph/0.1.0"` — with no
+  config flag to bypass it. HydraMemory talks to HydraDB entirely over its **HTTP JSON API**
+  instead (`hydra_client.py`), which works cleanly.
+- **Every write is exactly one relationship connecting two node patterns.** `CREATE` or `MERGE`
+  of a bare, unconnected node is rejected ("only one-hop edge patterns are executable"), and so
+  is any query mixing `MATCH` with `CREATE` ("write query is not executable by the mutation
+  engine"). The fix: use `MERGE` for every write — it correctly matches-or-creates each side of
+  the one-hop pattern by `id`, which is how ingestion "attaches a new Fact to an existing
+  Session" without ever needing `MATCH` + `CREATE` together.
+- **`id` must be an integer, and it's a global identity across the whole graph — not scoped per
+  label.** Two nodes of different labels can't share an `id` value. HydraMemory uses a simple
+  incrementing integer counter for `id` and a separate string `key` property (e.g. `"sess-01"`,
+  `"fact-07"`) for human-readable references.
+- **Pattern negation (`WHERE NOT (a)-[:R]->(b)`)** — the mechanism `PROJECT_CONTEXT.md`'s
+  original schema sketch proposed for finding "the fact nothing supersedes" — **isn't
+  supported.** That's exactly why the schema uses an explicit `current` boolean instead of
+  computing it via negation at query time.
+- **The request body key is `parameters`, not `params`**, for the HTTP API's parameterized
+  queries.
+
+## Setup
+
+Requires Docker Desktop and Python 3.9+.
+
+**1. Configure secrets**
+
+```bash
+cp .env.example .env
+# edit .env and set GROQ_API_KEY (https://console.groq.com)
+```
+
+**2. Start HydraDB**
+
+```bash
+mkdir -p hydradb-data/store hydradb-data/cache
+printf '%s\n' 'local-development-token-32-bytes' > hydradb-data/auth-token
+docker compose up -d
+```
+
+Confirm it's up:
+
+```bash
+curl -sS http://127.0.0.1:8443/v1/graphs/default/query \
+  -H "Authorization: Bearer local-development-token-32-bytes" \
+  -H 'X-Graph-Namespace: default' -H 'Content-Type: application/json' \
+  --data '{"cell_id":"cell-0","query":"MATCH (n {id: 1}) RETURN n.id"}'
+```
+
+**3. Install dependencies**
+
+```bash
+python -m venv venv
+source venv/Scripts/activate   # Windows Git Bash; use venv/bin/activate on macOS/Linux
+pip install -r requirements.txt
+```
+
+**4. Ingest the synthetic dataset**
+
+```bash
+python ingest/ingest.py
+```
+
+This reads `data/sessions.json`, extracts facts via Groq, and writes them to HydraDB with
+supersession detection. It prints each fact as it's written, including which ones superseded an
+earlier value.
+
+**5. Run the API**
+
+```bash
+python api/app.py
+```
+
+Serves `POST /ask` on `http://127.0.0.1:5000`:
+
+```bash
+curl -sS http://127.0.0.1:5000/ask -X POST -H 'Content-Type: application/json' \
+  --data '{"question": "Where does the user currently live?"}'
+# {"answer": "The user currently lives in Pune.", "found": true, "source_sessions": ["sess-07"]}
+```
+
+**6. Open the UI**
+
+Open `ui/index.html` directly in a browser (or serve it: `python -m http.server 8080 -d ui`).
+It's a static page that calls the API at `http://127.0.0.1:5000` — no build step.
+
+**7. Verify end-to-end**
+
+With HydraDB and the API both running:
+
+```bash
+python scripts/verify_e2e.py
+```
+
+Checks HydraDB and the API are reachable, then runs 7 fixed questions against whatever is
+currently in the graph and asserts on the result: five should resolve to the *current* value of
+a fact that was updated at least once (proving supersession), and two ask about things never
+stated in any session (proving abstention). Exits non-zero if anything fails.
+
+## Project structure
+
+```
+data/sessions.json     synthetic dataset: 9 sessions, 5 fact supersessions, 1 no-fact session
+ingest/ingest.py        sessions.json -> Groq extraction -> HydraDB writes
+api/app.py               POST /ask -> Cypher query -> Groq-phrased answer, or abstain
+ui/index.html            static single-page demo UI
+hydra_client.py          shared HydraDB HTTP API client
+llm_client.py             shared Groq client + the fixed predicate vocabulary
+docker-compose.yml       local HydraDB node
+```
+
+## The dataset
+
+`data/sessions.json` is 9 hand-written chat sessions spanning June-August 2026. Five facts get
+updated across sessions (location, job + title, favorite food, travel plan), each a clean
+old-value-to-new-value contradiction. One session (a book recommendation) deliberately contains
+no fact matching the tracked vocabulary, to confirm ingestion doesn't force-extract noise.
+Abstention is demonstrated by asking about anything outside the tracked vocabulary (e.g.
+favorite color, birthplace) — the graph has no such predicate, so `/ask` correctly returns
+`found: false`.
+
+## Attribution
+
+- [HydraDB](https://github.com/hydra-db/hydradb) (AGPL-3.0) — the graph database this project
+  is built on.
+- [Groq](https://groq.com) — hosts the `openai/gpt-oss-120b` model used for fact extraction,
+  question parsing, and answer phrasing, via its OpenAI-compatible API.
+- Python packages: `flask`, `requests`, `openai`, `python-dotenv` (see `requirements.txt`).
+- The synthetic dataset in `data/sessions.json` is original, written for this project.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

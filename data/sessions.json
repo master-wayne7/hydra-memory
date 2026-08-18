@@ -1,0 +1,109 @@
+{
+  "sessions": [
+    {
+      "id": "sess-01",
+      "index": 1,
+      "date": "2026-06-01",
+      "messages": [
+        {"role": "user", "text": "Hi! I just wanted to chat for a bit. I'm based in Delhi, been living here for a few years now."},
+        {"role": "assistant", "text": "Nice to meet you! Delhi's a great city. What do you do there?"},
+        {"role": "user", "text": "I work at Infosys as a Software Engineer."},
+        {"role": "assistant", "text": "That's great, how do you like it so far?"},
+        {"role": "user", "text": "It's good! Also I have a dog named Rocky, he's a golden retriever."},
+        {"role": "assistant", "text": "Rocky sounds adorable!"}
+      ]
+    },
+    {
+      "id": "sess-02",
+      "index": 2,
+      "date": "2026-06-08",
+      "messages": [
+        {"role": "user", "text": "Hey again. Just wanted to say, I tried this amazing biryani place near my office."},
+        {"role": "assistant", "text": "Oh nice, biryani is great! Is it your favorite food?"},
+        {"role": "user", "text": "Yeah, biryani is definitely my favorite food."},
+        {"role": "assistant", "text": "Good to know! Any weekend plans?"},
+        {"role": "user", "text": "Just relaxing this weekend, nothing major."}
+      ]
+    },
+    {
+      "id": "sess-03",
+      "index": 3,
+      "date": "2026-06-15",
+      "messages": [
+        {"role": "user", "text": "I'm starting to plan a trip! Thinking of going to Goa in August."},
+        {"role": "assistant", "text": "Goa in August sounds fun, though it's monsoon season there."},
+        {"role": "user", "text": "Yeah I know, but I really want to see the rain. That's my travel plan for now."},
+        {"role": "assistant", "text": "Sounds like a nice getaway."}
+      ]
+    },
+    {
+      "id": "sess-04",
+      "index": 4,
+      "date": "2026-06-22",
+      "messages": [
+        {"role": "user", "text": "Big news! I got a new job."},
+        {"role": "assistant", "text": "Congrats! Where are you working now?"},
+        {"role": "user", "text": "I moved to Zomato. I'm now a Senior Software Engineer there."},
+        {"role": "assistant", "text": "That's a great step up! How's the new role treating you?"},
+        {"role": "user", "text": "It's exciting so far, definitely busier than Infosys."}
+      ]
+    },
+    {
+      "id": "sess-05",
+      "index": 5,
+      "date": "2026-06-29",
+      "messages": [
+        {"role": "user", "text": "Random thing, I've actually changed my mind about my favorite food."},
+        {"role": "assistant", "text": "Oh really? What is it now?"},
+        {"role": "user", "text": "Dosa. I've been eating it way more than biryani lately, it's my favorite now."},
+        {"role": "assistant", "text": "Dosa is a solid choice too!"}
+      ]
+    },
+    {
+      "id": "sess-06",
+      "index": 6,
+      "date": "2026-07-06",
+      "messages": [
+        {"role": "user", "text": "Quick update on my travel plans."},
+        {"role": "assistant", "text": "Sure, what's changed?"},
+        {"role": "user", "text": "I decided against Goa. I'm now planning to go to Manali in September instead."},
+        {"role": "assistant", "text": "Manali's beautiful, especially with the mountains. Good choice!"}
+      ]
+    },
+    {
+      "id": "sess-07",
+      "index": 7,
+      "date": "2026-07-20",
+      "messages": [
+        {"role": "user", "text": "Another big update - I actually moved cities."},
+        {"role": "assistant", "text": "Oh wow, where to?"},
+        {"role": "user", "text": "I moved to Pune, mainly because of the new job at Zomato."},
+        {"role": "assistant", "text": "That makes sense, closer to work maybe?"},
+        {"role": "user", "text": "Exactly, cut my commute a lot."}
+      ]
+    },
+    {
+      "id": "sess-08",
+      "index": 8,
+      "date": "2026-08-03",
+      "messages": [
+        {"role": "user", "text": "Rocky's doing great by the way, just got back from a walk with him."},
+        {"role": "assistant", "text": "Glad to hear Rocky's doing well!"},
+        {"role": "user", "text": "Yeah he loves the new neighborhood in Pune."},
+        {"role": "assistant", "text": "That's sweet."}
+      ]
+    },
+    {
+      "id": "sess-09",
+      "index": 9,
+      "date": "2026-08-10",
+      "messages": [
+        {"role": "user", "text": "I've been reading this really good sci-fi novel lately."},
+        {"role": "assistant", "text": "Oh nice, which one?"},
+        {"role": "user", "text": "It's called Project Hail Mary. Really gripping so far."},
+        {"role": "assistant", "text": "I've heard great things about that one!"},
+        {"role": "user", "text": "Yeah, definitely recommend it if you're into space stuff."}
+      ]
+    }
+  ]
+}
