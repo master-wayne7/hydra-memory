@@ -90,6 +90,7 @@
   }
   .status.found { color: var(--found); background: rgba(62, 201, 122, 0.12); }
   .status.notfound { color: var(--notfound); background: rgba(224, 87, 74, 0.12); }
+  .status.ambiguous { color: #f0ad4e; background: rgba(240, 173, 78, 0.12); }
   .answer {
     font-size: 1.05rem;
     line-height: 1.5;
@@ -122,6 +123,24 @@
     color: var(--text);
     border-color: var(--accent);
   }
+  .baseline-box {
+    margin-top: 18px;
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
+  }
+  .baseline-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 8px;
+  }
+  .baseline-col {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-size: 0.85rem;
+  }
 </style>
 </head>
 <body>
@@ -138,6 +157,39 @@
     <span class="status" id="status-badge"></span>
     <p class="answer" id="answer-text"></p>
     <p class="sources" id="sources-text"></p>
+    
+    <div id="evidence-section" style="margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; display: none;">
+      <h3 style="font-size: 0.85rem; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; letter-spacing: 0.03em;">Why this answer? (Evidence checklist)</h3>
+      <ul id="evidence-list" style="list-style: none; padding: 0; margin: 0; font-size: 0.85rem; color: var(--muted); line-height: 1.6;">
+      </ul>
+    </div>
+
+    <div id="changes-section" style="margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; display: none;">
+      <h3 style="font-size: 0.85rem; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; letter-spacing: 0.03em;">Memory Changes Diff</h3>
+      <div id="changes-container" style="display: flex; flex-direction: column; gap: 8px;">
+      </div>
+    </div>
+    
+    <div id="timeline-section" style="margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; display: none;">
+      <h3 style="font-size: 0.85rem; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; letter-spacing: 0.03em;">Temporal History (HydraDB Chain)</h3>
+      <div id="timeline-container" style="display: flex; flex-direction: column; gap: 8px;">
+      </div>
+    </div>
+
+    <div id="baseline-section" class="baseline-box" style="display: none;">
+      <h3 style="font-size: 0.85rem; text-transform: uppercase; color: var(--muted); margin: 0 0 4px; letter-spacing: 0.03em;">Graph Memory vs Naive Context</h3>
+      <div class="baseline-grid">
+        <div class="baseline-col" style="border-left: 3px solid var(--found);">
+          <strong style="color: var(--found);">HydraMemory (Graph)</strong>
+          <p id="baseline-hydra" style="margin: 6px 0 0; font-size: 0.9rem; line-height: 1.4;"></p>
+        </div>
+        <div class="baseline-col" style="border-left: 3px solid var(--notfound);">
+          <strong style="color: var(--notfound);">Naive LLM Baseline</strong>
+          <p id="baseline-naive" style="margin: 6px 0 0; font-size: 0.9rem; line-height: 1.4;"></p>
+        </div>
+      </div>
+      <p id="baseline-expl" style="margin: 10px 0 0; font-size: 0.78rem; color: var(--muted); line-height: 1.4;"></p>
+    </div>
   </div>
 
   <div class="examples">
@@ -146,6 +198,7 @@
     <button data-q="What is the user's favorite food?">Favorite food?</button>
     <button data-q="What are the user's travel plans?">Travel plans?</button>
     <button data-q="What is the user's favorite color?">Favorite color? (unanswerable)</button>
+    <button data-q="What changed about the user recently?">What changed? (Diff)</button>
   </div>
 </main>
 
@@ -159,6 +212,17 @@
   const badge = document.getElementById("status-badge");
   const answerText = document.getElementById("answer-text");
   const sourcesText = document.getElementById("sources-text");
+  
+  const evidenceSection = document.getElementById("evidence-section");
+  const evidenceList = document.getElementById("evidence-list");
+  const changesSection = document.getElementById("changes-section");
+  const changesContainer = document.getElementById("changes-container");
+  const timelineSection = document.getElementById("timeline-section");
+  const timelineContainer = document.getElementById("timeline-container");
+  const baselineSection = document.getElementById("baseline-section");
+  const baselineHydra = document.getElementById("baseline-hydra");
+  const baselineNaive = document.getElementById("baseline-naive");
+  const baselineExpl = document.getElementById("baseline-expl");
 
   async function ask(question) {
     submitBtn.disabled = true;
@@ -172,13 +236,128 @@
       const data = await res.json();
 
       card.classList.add("visible");
-      if (data.found) {
+      evidenceSection.style.display = "block";
+      evidenceList.innerHTML = "";
+      timelineContainer.innerHTML = "";
+      timelineSection.style.display = "none";
+      changesSection.style.display = "none";
+      changesContainer.innerHTML = "";
+      baselineSection.style.display = "none";
+
+      // Set status badge correctly
+      if (data.status === "found") {
         badge.textContent = "found";
         badge.className = "status found";
-      } else {
+      } else if (data.status === "ambiguous") {
+        badge.textContent = "ambiguous";
+        badge.className = "status ambiguous";
+      } else if (data.status === "not_found") {
         badge.textContent = "not in memory";
         badge.className = "status notfound";
+      } else {
+        badge.textContent = data.status || "error";
+        badge.className = "status notfound";
       }
+
+      // Render evidence list
+      if (data.evidence) {
+        const ev = data.evidence;
+        evidenceList.innerHTML = `
+          <li style="color: ${ev.fact_found ? 'var(--found)' : 'var(--notfound)'}; font-weight: 500;">
+            ${ev.fact_found ? '✓ Matching memory found' : '✗ No matching fact exists in HydraDB'}
+          </li>
+          <li style="color: ${ev.current_fact ? 'var(--found)' : 'var(--notfound)'}; font-weight: 500;">
+            ${ev.current_fact ? '✓ Current fact identified' : '✗ No current memory found'}
+          </li>
+          <li style="color: ${ev.history_checked ? 'var(--found)' : 'var(--muted)'}; font-weight: 500;">
+            ${ev.history_checked ? '✓ Historical updates checked' : '○ History check skipped'}
+          </li>
+          <li style="color: ${ev.supersession_detected ? 'var(--found)' : 'var(--muted)'}; font-weight: 500;">
+            ${ev.supersession_detected ? '✓ Previous values superseded' : '○ No supersession detected'}
+          </li>
+          <li style="color: ${ev.answer_generation_allowed ? 'var(--found)' : 'var(--notfound)'}; font-weight: 500;">
+            ${ev.answer_generation_allowed ? '✓ Answer generation allowed' : '✓ Gated: Synthesis LLM skipped (abstention)'}
+          </li>
+        `;
+      }
+
+      // Populate memory changes diff if present
+      if (data.changes && data.changes.length > 0) {
+        changesSection.style.display = "block";
+        data.changes.forEach(c => {
+          const itemDiv = document.createElement("div");
+          itemDiv.style.background = "rgba(255,255,255,0.02)";
+          itemDiv.style.border = "1px solid var(--border)";
+          itemDiv.style.borderRadius = "6px";
+          itemDiv.style.padding = "10px 12px";
+          itemDiv.style.fontSize = "0.9rem";
+          
+          const chainText = c.history.join(" &rarr; ");
+          itemDiv.innerHTML = `
+            <div>
+              <strong style="color: var(--muted); font-size: 0.75rem; text-transform: uppercase;">${c.predicate}</strong>
+              <div style="margin-top: 4px; font-weight: 500;">${chainText} <span style="color: var(--found); font-weight: bold; margin-left: 4px;">✓</span></div>
+            </div>
+          `;
+          changesContainer.appendChild(itemDiv);
+        });
+      }
+
+      // Populate timeline of history
+      if (data.memory?.history && data.memory.history.length > 0) {
+        timelineSection.style.display = "block";
+        
+        // History returned from the API is sorted chronologically: oldest first.
+        // We render it backwards so the current one is at the top (newest first).
+        const revHistory = [...data.memory.history].reverse();
+        revHistory.forEach((item, index) => {
+          const itemDiv = document.createElement("div");
+          itemDiv.style.background = "rgba(255,255,255,0.02)";
+          itemDiv.style.border = "1px solid var(--border)";
+          itemDiv.style.borderRadius = "6px";
+          itemDiv.style.padding = "10px 12px";
+          itemDiv.style.display = "flex";
+          itemDiv.style.justifyContent = "space-between";
+          itemDiv.style.alignItems = "center";
+          
+          if (item.current) {
+            itemDiv.style.borderColor = "var(--found)";
+          }
+          
+          // Join sessions if multiple exist
+          const sessText = Array.isArray(item.sessions) ? item.sessions.join(", ") : item.session;
+          
+          itemDiv.innerHTML = `
+            <div>
+              <strong style="color: ${item.current ? 'var(--found)' : 'var(--text)'}; font-size: 0.95rem;">${item.value}</strong>
+              <div style="font-size: 0.75rem; color: var(--muted); margin-top: 2px;">Session ${sessText} &middot; ${item.date}</div>
+            </div>
+            <span class="status ${item.current ? 'found' : 'notfound'}" style="font-size: 0.65rem; margin: 0;">${item.current ? 'current' : 'superseded'}</span>
+          `;
+          
+          timelineContainer.appendChild(itemDiv);
+          
+          if (index < revHistory.length - 1) {
+            const arrowDiv = document.createElement("div");
+            arrowDiv.style.textAlign = "center";
+            arrowDiv.style.color = "var(--muted)";
+            arrowDiv.style.fontSize = "0.75rem";
+            arrowDiv.style.fontWeight = "bold";
+            arrowDiv.style.margin = "4px 0";
+            arrowDiv.innerHTML = "↑ SUPERSEDES";
+            timelineContainer.appendChild(arrowDiv);
+          }
+        });
+      }
+
+      // Populate baseline comparison
+      if (data.baseline_comparison) {
+        baselineSection.style.display = "block";
+        baselineHydra.textContent = data.baseline_comparison.hydramemory;
+        baselineNaive.textContent = data.baseline_comparison.baseline;
+        baselineExpl.innerHTML = `<strong>Why it matters:</strong> ${data.baseline_comparison.explanation}`;
+      }
+
       answerText.textContent = data.answer || "(no answer)";
       sourcesText.textContent = data.source_sessions && data.source_sessions.length
         ? "Source: " + data.source_sessions.map(s => s).join(", ")
@@ -189,6 +368,10 @@
       badge.className = "status notfound";
       answerText.textContent = "Could not reach the API. Is it running on " + API_URL + "?";
       sourcesText.textContent = "";
+      evidenceSection.style.display = "none";
+      timelineSection.style.display = "none";
+      changesSection.style.display = "none";
+      baselineSection.style.display = "none";
     } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = "Ask";
