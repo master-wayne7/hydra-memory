@@ -13,15 +13,21 @@ instead:
 2. **Abstain correctly.** If a question's answer was never stated in any session, the system
    says "I don't have that in memory" instead of letting an LLM guess from the nearest match.
 
-This is a small, hand-crafted demo (9 synthetic chat sessions, one shared graph), not a
-benchmark run — the goal is a legible, convincing proof of the two properties above.
+Two things ship in this repo:
+
+1. **A small, hand-crafted demo** (9 synthetic chat sessions, `ingest/ingest.py` + `api/app.py`)
+   — a legible, convincing proof of the two properties above, on a closed 6-predicate vocabulary.
+2. **A real LongMemEval-S benchmark run** (`eval/`) — open-vocabulary fact extraction and
+   question-answering over actual multi-session chat histories from the
+   [LongMemEval](https://github.com/xiaowu0162/LongMemEval) dataset, entirely on a local model.
+   See [LongMemEval evaluation](#longmemeval-evaluation) below.
 
 ## How it works
 
 ```
-data/sessions.json  --(Groq extraction)-->  ingest/ingest.py  --(writes)-->  HydraDB
+data/sessions.json  --(LLM extraction)-->  ingest/ingest.py  --(writes)-->  HydraDB
                                                                                   |
-ui/index.html  <--(JSON)--  api/app.py  --(Cypher query + Groq phrasing)--------+
+ui/index.html  <--(JSON)--  api/app.py  --(Cypher query + LLM phrasing)---------+
 ```
 
 **Schema:**
@@ -78,12 +84,16 @@ turned up several load-bearing constraints worth documenting for anyone else bui
 
 Requires Docker Desktop and Python 3.9+.
 
-**1. Configure secrets**
+**1. Configure the LLM provider**
 
 ```bash
 cp .env.example .env
-# edit .env and set GROQ_API_KEY (https://console.groq.com)
 ```
+
+Default is `LLM_PROVIDER=ollama` — no API key needed, but requires a local Ollama install with
+`qwen2.5:3b-instruct` and `qwen2.5:7b-instruct` pulled (see [LongMemEval evaluation](#longmemeval-evaluation)
+below). To use a hosted provider instead, set `LLM_PROVIDER=groq` (or `gemini` / `cerebras`) in
+`.env` and add the matching API key (e.g. `GROQ_API_KEY`, from https://console.groq.com).
 
 **2. Start HydraDB**
 
@@ -116,8 +126,9 @@ pip install -r requirements.txt
 python ingest/ingest.py
 ```
 
-This reads `data/sessions.json`, extracts facts via Groq, and writes them to HydraDB with
-supersession detection. It prints each fact as it's written, including which ones superseded an
+This reads `data/sessions.json`, extracts facts via whichever LLM provider is configured in
+`.env`, and writes them to HydraDB with supersession detection. It prints each fact as it's
+written, including which ones superseded an
 earlier value.
 
 **5. Run the API**
@@ -152,16 +163,70 @@ currently in the graph and asserts on the result: five should resolve to the *cu
 a fact that was updated at least once (proving supersession), and two ask about things never
 stated in any session (proving abstention). Exits non-zero if anything fails.
 
+## LongMemEval evaluation
+
+`eval/` runs the same graph-backed memory architecture against real [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval)
+instances — each one 30-50 real chat sessions (~115k tokens) that a question's answer may
+require synthesizing across, with facts that get restated, updated, or never mentioned at all.
+It deliberately differs from the Part 1 demo above:
+
+- **Open predicate vocabulary** instead of the fixed 6-value enum — real LongMemEval questions
+  span arbitrary topics, so the model invents a short snake_case predicate per fact rather than
+  being forced into a closed set.
+- **Cumulative vs. replace tracking** — a fact is tagged `cumulative: true` if it's one entry in
+  an open-ended list the user is building up (a restaurant tried, a book read), so repeated
+  mentions of the same topic accumulate instead of overwriting each other the way a
+  single-value fact (home city, job title) correctly does via `SUPERSEDES`.
+- **Keyword-filtered candidate retrieval** — when a question's instance has 50-80+ current
+  facts, only the ones sharing keywords with the question are handed to the answering model,
+  instead of dumping the entire candidate set into context.
+- **Runs entirely on a local Ollama model** (`qwen2.5:3b-instruct`, with automatic fallback to
+  `qwen2.5:7b-instruct` only when the fast model's output fails schema validation) — no API
+  key, no rate limits, no per-token cost.
+
+**Result:** 7/8 (88%) on the LongMemEval-S subset in `eval/data/subset.json`, covering both
+`knowledge-update` and `abstention` question categories. See `eval/results.json` for the
+per-question breakdown.
+
+**Running it:**
+
+```bash
+# 1. Pull the local models (one-time)
+ollama pull qwen2.5:3b-instruct
+ollama pull qwen2.5:7b-instruct
+
+# 2. Point llm_client.py at Ollama
+echo "LLM_PROVIDER=ollama" >> .env
+
+# 3. Start HydraDB (see Setup above), then run the eval
+python eval/run_eval.py
+```
+
+Prints per-question progress and a final accuracy table; writes `eval/results.json`. A
+completed instance is cached — re-running after an interruption skips re-ingesting any question
+whose facts are already in HydraDB.
+
+The same ingestion/answering/grading logic (`eval/engine.py`) is also exposed live through
+`api/app.py`'s `/eval/*` endpoints and `ui/index.html`'s eval tab, for an interactive walkthrough
+of a single instance instead of a full batch run.
+
 ## Project structure
 
 ```
 data/sessions.json     synthetic dataset: 9 sessions, 5 fact supersessions, 1 no-fact session
-ingest/ingest.py        sessions.json -> Groq extraction -> HydraDB writes
-api/app.py               POST /ask -> Cypher query -> Groq-phrased answer, or abstain
-ui/index.html            static single-page demo UI
+ingest/ingest.py        sessions.json -> LLM extraction -> HydraDB writes (closed vocabulary)
+api/app.py               POST /ask -> Cypher query -> LLM-phrased answer, or abstain;
+                          also serves the /eval/* endpoints for the LongMemEval flow
+ui/index.html            static single-page demo UI (Part 1 demo + LongMemEval eval tab)
 hydra_client.py          shared HydraDB HTTP API client
-llm_client.py             shared Groq client + the fixed predicate vocabulary
+llm_client.py             shared LLM client -- groq/gemini/cerebras/ollama providers,
+                          the fixed predicate vocabulary, schema-constrained JSON extraction
 docker-compose.yml       local HydraDB node
+
+eval/engine.py           LongMemEval ingestion/answering/grading (open vocabulary,
+                          cumulative-fact tracking, keyword-filtered retrieval)
+eval/run_eval.py         CLI batch runner over eval/data/subset.json -> eval/results.json
+eval/data/subset.json    8-instance LongMemEval-S subset used for the 88% result above
 ```
 
 ## The dataset
@@ -178,8 +243,13 @@ favorite color, birthplace) — the graph has no such predicate, so `/ask` corre
 
 - [HydraDB](https://github.com/hydra-db/hydradb) (AGPL-3.0) — the graph database this project
   is built on.
-- [Groq](https://groq.com) — hosts the `openai/gpt-oss-120b` model used for fact extraction,
-  question parsing, and answer phrasing, via its OpenAI-compatible API.
+- [LongMemEval](https://github.com/xiaowu0162/LongMemEval) — the benchmark dataset used in
+  `eval/data/subset.json` for the evaluation results above.
+- [Groq](https://groq.com) — hosts the `openai/gpt-oss-120b` model, one of several supported
+  LLM providers (alongside Gemini, Cerebras, and local Ollama), used for fact extraction,
+  question parsing, and answer phrasing via its OpenAI-compatible API.
+- [Ollama](https://ollama.com) — runs the local `qwen2.5:3b-instruct` / `qwen2.5:7b-instruct`
+  models used for the LongMemEval evaluation, with no API key or rate limit.
 - Python packages: `flask`, `requests`, `openai`, `python-dotenv` (see `requirements.txt`).
 - The synthetic dataset in `data/sessions.json` is original, written for this project.
 
