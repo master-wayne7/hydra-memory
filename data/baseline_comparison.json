@@ -1,0 +1,37 @@
+{
+  "Where does the user currently live?": {
+    "hydramemory": "Pune",
+    "baseline": "Delhi (or Bangalore)",
+    "explanation": "HydraMemory correctly traverses the SUPERSEDES relationships to identify Pune as the single current location, whereas the naive context dump returns a stale location (Delhi or Bangalore) from the conversation history."
+  },
+  "Where does the user work?": {
+    "hydramemory": "Zomato",
+    "baseline": "Infosys",
+    "explanation": "HydraMemory tracks that the user's employment at Zomato supersedes their previous job at Infosys, whereas the naive context dump mixes up the timeline."
+  },
+  "What is the user's favorite food?": {
+    "hydramemory": "Dosa",
+    "baseline": "Biryani",
+    "explanation": "HydraMemory returns Dosa (the latest current fact), while the naive context dump refers to the older favorite food (Biryani)."
+  },
+  "What are the user's travel plans?": {
+    "hydramemory": "Manali in September",
+    "baseline": "Goa in August",
+    "explanation": "The user canceled Goa and booked Manali. HydraMemory retrieves Manali, while the naive context dump returns the canceled Goa trip."
+  },
+  "What is the user's pet's name?": {
+    "hydramemory": "Rocky",
+    "baseline": "Rocky",
+    "explanation": "Both systems retrieve Rocky, but HydraMemory validates the provenance back to Session 01 and Session 08, showing consistent ownership."
+  },
+  "What is the user's favorite color?": {
+    "hydramemory": "I don't have that in memory.",
+    "baseline": "Blue (hallucinated)",
+    "explanation": "HydraMemory identifies that no matching fact exists in the graph and safely abstains. The naive context dump attempts to guess or hallucinate an answer."
+  },
+  "Where did the user previously live?": {
+    "hydramemory": "Delhi, Bangalore",
+    "baseline": "Delhi, Bangalore, Pune",
+    "explanation": "HydraMemory retrieves only the superseded historical records (Delhi, Bangalore), excluding the current location (Pune)."
+  }
+}

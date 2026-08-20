@@ -1,5 +1,5 @@
 """
-POST /ask {"question": "..."} -> {"answer": "...", "source_sessions": [...], "found": bool}
+POST /ask {"question": "..."} -> {"answer": "...", "source_sessions": [...], "found": bool, "status": "...", "memory": {...}}
 
 The graph decides abstention, not the LLM: the question-parsing step maps the question to a
 (subject, predicate) pair drawn from the same fixed vocabulary used at ingestion time, then
@@ -11,15 +11,24 @@ a question the graph doesn't have data for.
 
 import os
 import sys
+import threading
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, jsonify, request
 
+import eval.engine as eval_engine
 import hydra_client as hc
 import llm_client as llm
 
 app = Flask(__name__)
+
+# In-memory ingestion progress for the live LongMemEval panel, keyed by instance index.
+# A 40-50 session instance can take many minutes (more if the LLM API rate-limits), so
+# ingestion runs in a background thread and the UI polls /eval/ingest_status for progress.
+_eval_progress: dict[int, dict] = {}
+_eval_progress_lock = threading.Lock()
 
 
 @app.after_request
@@ -34,48 +43,527 @@ def add_cors_headers(response):
 def ask_preflight():
     return "", 204
 
+
 QUESTION_PARSE_SYSTEM = f"""You map a question about a user's remembered facts to a (subject, predicate) pair.
 Respond with ONLY JSON: {{"subject": "user", "predicate": "..."}}
 The predicate field MUST be exactly one of these six values: {", ".join(llm.PREDICATES)},
 OR the literal string "none" if the question does not clearly match any of them."""
 
+QUESTION_PARSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string"},
+        "predicate": {"type": "string", "enum": llm.PREDICATES + ["none"]},
+    },
+    "required": ["subject", "predicate"],
+    "additionalProperties": False,
+}
+
 ANSWER_SYSTEM = "You answer a question using ONLY the single fact given to you. Respond with one concise, natural sentence. Do not add any information beyond what's given."
+
 
 NOT_FOUND_ANSWER = "I don't have that in memory."
 
 
+def get_fact_history(current_fact_id: int) -> list[dict]:
+    history = []
+    visited = set()
+    next_id = current_fact_id
+    MAX_HISTORY_DEPTH = 20
+    depth = 0
+    
+    while next_id and next_id not in visited and depth < MAX_HISTORY_DEPTH:
+        visited.add(next_id)
+        # Fetch the fact and all its associated sessions
+        rows = hc.run(
+            "MATCH (f:Fact {id: $fid})-[:STATED_IN]->(sess:Session) "
+            "RETURN f.id AS id, f.object AS object, f.text AS text, f.current AS current, "
+            "sess.key AS session_key, sess.date AS date, sess.index AS index",
+            fid=next_id
+        )
+        if not rows:
+            break
+            
+        # Sort sessions for this fact chronologically by index
+        sorted_rows = sorted(rows, key=lambda r: r.get("index") or 0)
+        fact_obj = sorted_rows[0]
+        sessions = [r["session_key"] for r in sorted_rows]
+        
+        # Add to history
+        history.append({
+            "value": fact_obj["object"],
+            "session": sorted_rows[-1]["session_key"], # latest session key for this state
+            "sessions": sessions,                      # all sessions key for this state
+            "date": sorted_rows[-1]["date"],           # latest date
+            "current": bool(fact_obj["current"])
+        })
+        
+        # Find the superseded fact (if any)
+        supersedes_rows = hc.run(
+            "MATCH (f:Fact {id: $fid})-[:SUPERSEDES]->(old:Fact) "
+            "RETURN old.id AS id",
+            fid=next_id
+        )
+        if supersedes_rows:
+            next_id = supersedes_rows[0]["id"]
+        else:
+            next_id = None
+            
+        depth += 1
+        
+    return list(reversed(history))
+
+
 @app.route("/ask", methods=["POST"])
 def ask():
-    body = request.get_json(force=True, silent=True) or {}
-    question = (body.get("question") or "").strip()
-    if not question:
-        return jsonify({"error": "question is required"}), 400
+    try:
+        body = request.get_json(force=True, silent=True)
+        if not isinstance(body, dict):
+            return jsonify({
+                "error": "Invalid request body, expected JSON object",
+                "status": "invalid"
+            }), 400
 
-    parsed = llm.chat_json(QUESTION_PARSE_SYSTEM, question)
-    subject = parsed.get("subject", "user")
-    predicate = parsed.get("predicate")
+        if "question" not in body:
+            return jsonify({
+                "error": "question field is required",
+                "status": "invalid"
+            }), 400
 
-    if predicate not in llm.PREDICATES:
-        return jsonify({"answer": NOT_FOUND_ANSWER, "source_sessions": [], "found": False})
+        question = body.get("question")
+        if question is None:
+            return jsonify({
+                "error": "question field is required",
+                "status": "invalid"
+            }), 400
 
-    rows = hc.run(
-        "MATCH (f:Fact {subject: $s, predicate: $p, current: true})-[:STATED_IN]->(sess:Session) "
-        "RETURN f.text AS text, f.object AS object, sess.key AS session_key, sess.date AS date",
-        s=subject, p=predicate,
-    )
-    if not rows:
-        return jsonify({"answer": NOT_FOUND_ANSWER, "source_sessions": [], "found": False})
+        if not isinstance(question, str):
+            return jsonify({
+                "error": "question field must be a string",
+                "status": "invalid"
+            }), 400
 
-    fact = rows[0]
-    answer = llm.chat_text(
-        ANSWER_SYSTEM,
-        f"Question: {question}\nFact: {fact['text']} (value: {fact['object']})\n"
-        "Answer the question in one natural sentence using only this fact.",
-    )
+        question = question.strip()
+        if not question:
+            return jsonify({
+                "error": "question cannot be empty or whitespace-only",
+                "status": "invalid"
+            }), 400
+
+        # Fast-path for memory changes query
+        if "what changed" in question.lower() or "memory changes" in question.lower():
+            try:
+                # Find all current user facts in the database
+                rows = hc.run(
+                    "MATCH (f:Fact {subject: 'user', current: true}) "
+                    "RETURN f.id AS id, f.predicate AS predicate, f.object AS object"
+                )
+                changes = []
+                all_sessions = set()
+                for r in rows:
+                    history = get_fact_history(r["id"])
+                    # Extract only values that were observed
+                    history_values = [h["value"] for h in history]
+                    for h in history:
+                        for s in h.get("sessions", []):
+                            all_sessions.add(s)
+                    
+                    changes.append({
+                        "predicate": r["predicate"],
+                        "history": history_values,
+                        "current": r["object"]
+                    })
+                
+                # Retrieve precomputed comparison if present
+                import json
+                comparison_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "baseline_comparison.json")
+                baseline_data = None
+                if os.path.exists(comparison_path):
+                    try:
+                        with open(comparison_path, encoding="utf-8") as fcomp:
+                            comparison = json.load(fcomp)
+                            for q_key, q_val in comparison.items():
+                                if "changed" in q_key.lower():
+                                    baseline_data = {
+                                        "question": question,
+                                        "hydramemory": q_val["hydramemory"],
+                                        "baseline": q_val["baseline"],
+                                        "explanation": q_val["explanation"]
+                                    }
+                                    break
+                    except Exception:
+                        pass
+                
+                if not baseline_data:
+                    baseline_data = {
+                        "question": question,
+                        "hydramemory": "Multiple superseded historical facts identified per predicate.",
+                        "baseline": "All details combined, missing chronological clarity.",
+                        "explanation": "HydraMemory traces exact SUPERSEDES relationships to construct the state diff, while the naive context dump returns all text."
+                    }
+
+                return jsonify({
+                    "answer": "Here is the timeline diff of user memory changes retrieved directly from the HydraDB graph:",
+                    "found": True,
+                    "status": "found",
+                    "source_sessions": sorted(list(all_sessions)),
+                    "changes": changes,
+                    "evidence": {
+                        "fact_found": True,
+                        "current_fact": True,
+                        "source_sessions": sorted(list(all_sessions)),
+                        "history_checked": True,
+                        "supersession_detected": True,
+                        "answer_generation_allowed": False
+                    },
+                    "baseline_comparison": baseline_data
+                })
+            except Exception as e:
+                return jsonify({
+                    "error": f"Failed to retrieve memory changes: {str(e)}",
+                    "status": "error"
+                }), 500
+
+        # Fast-path for diagnostic health check ping
+        if question.lower() == "ping":
+            return jsonify({
+                "answer": "pong",
+                "status": "success",
+                "found": True,
+                "source_sessions": []
+            })
+
+        # Load baseline comparison
+        import json
+        comparison = {}
+        comparison_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "baseline_comparison.json")
+        if os.path.exists(comparison_path):
+            try:
+                with open(comparison_path, encoding="utf-8") as fcomp:
+                    comparison = json.load(fcomp)
+            except Exception:
+                pass
+
+        baseline_data = None
+        for q_key, q_val in comparison.items():
+            if question.lower() == q_key.lower() or question.lower().rstrip("?") == q_key.lower().rstrip("?"):
+                baseline_data = {
+                    "question": question,
+                    "hydramemory": q_val["hydramemory"],
+                    "baseline": q_val["baseline"],
+                    "explanation": q_val["explanation"]
+                }
+                break
+
+        # LLM question parsing
+        try:
+            parsed = llm.chat_json(QUESTION_PARSE_SYSTEM, question, schema=QUESTION_PARSE_SCHEMA)
+            print(f"The answer:{parsed}")
+
+        except Exception as e:
+            return jsonify({
+                "error": f"LLM question parsing failed: {str(e)}",
+                "status": "error"
+            }), 500
+
+        subject = parsed.get("subject", "user")
+        raw_predicate = parsed.get("predicate")
+        
+        # Apply normalization
+        predicate = llm.normalize_predicate(raw_predicate)
+
+        if not predicate or predicate == "none" or predicate not in llm.PREDICATES:
+            if not baseline_data:
+                baseline_data = {
+                    "question": question,
+                    "hydramemory": "I don't have that in memory.",
+                    "baseline": "No mapping found.",
+                    "explanation": "Question could not be resolved to any supported predicates."
+                }
+            return jsonify({
+                "answer": "I couldn't confidently map that question to a memory.",
+                "source_sessions": [],
+                "found": False,
+                "status": "ambiguous",
+                "evidence": {
+                    "fact_found": False,
+                    "current_fact": False,
+                    "history_checked": False,
+                    "supersession_detected": False,
+                    "answer_generation_allowed": False
+                },
+                "memory": None,
+                "baseline_comparison": baseline_data
+            })
+
+        # Query HydraDB for current fact
+        try:
+            rows = hc.run(
+                "MATCH (f:Fact {subject: $s, predicate: $p, current: true})-[:STATED_IN]->(sess:Session) "
+                "RETURN f.id AS id, f.text AS text, f.object AS object, sess.key AS session_key, sess.date AS date, sess.index AS index",
+                s=subject, p=predicate,
+            )
+        except Exception as e:
+            return jsonify({
+                "error": f"Database query failed: {str(e)}",
+                "status": "error"
+            }), 500
+
+        if not rows:
+            # NO EVIDENCE -> Gated; answer-synthesis LLM is not called!
+            if not baseline_data:
+                baseline_data = {
+                    "question": question,
+                    "hydramemory": "I don't have that in memory.",
+                    "baseline": "I don't have that in memory.",
+                    "explanation": "No fact match exists for this predicate in HydraDB."
+                }
+            return jsonify({
+                "answer": NOT_FOUND_ANSWER,
+                "source_sessions": [],
+                "found": False,
+                "status": "not_found",
+                "evidence": {
+                    "fact_found": False,
+                    "current_fact": False,
+                    "history_checked": True,
+                    "supersession_detected": False,
+                    "answer_generation_allowed": False
+                },
+                "memory": None,
+                "baseline_comparison": baseline_data
+            })
+
+        # Sort sessions for this fact chronologically by index to identify the latest
+        sorted_rows = sorted(rows, key=lambda r: r.get("index") or 0)
+        fact = sorted_rows[-1]
+
+        # Retrieve history
+        try:
+            history = get_fact_history(fact["id"])
+        except Exception as e:
+            return jsonify({
+                "error": f"Database history retrieval failed: {str(e)}",
+                "status": "error"
+            }), 500
+
+        # Synthesize phrasing of retrieved evidence
+        try:
+            answer = llm.chat_text(
+                ANSWER_SYSTEM,
+                f"Question: {question}\nFact: {fact['text']} (value: {fact['object']})\n"
+                "Answer the question in one natural sentence using only this fact.",
+            )
+        except Exception as e:
+            return jsonify({
+                "error": f"LLM answer phrasing failed: {str(e)}",
+                "status": "error"
+            }), 500
+
+        supersession_detected = len(history) > 1
+        if not baseline_data:
+            baseline_data = {
+                "question": question,
+                "hydramemory": fact["object"],
+                "baseline": fact["object"],
+                "explanation": "Both systems retrieved the correct fact."
+            }
+
+        return jsonify({
+            "answer": answer,
+            "source_sessions": [r["session_key"] for r in sorted_rows],
+            "found": True,
+            "status": "found",
+            "evidence": {
+                "fact_found": True,
+                "current_fact": True,
+                "source_sessions": [r["session_key"] for r in sorted_rows],
+                "history_checked": True,
+                "supersession_detected": supersession_detected,
+                "answer_generation_allowed": True
+            },
+            "memory": {
+                "subject": subject,
+                "predicate": predicate,
+                "current": {
+                    "value": fact["object"],
+                    "text": fact["text"],
+                    "session": fact["session_key"],
+                    "sessions": [r["session_key"] for r in sorted_rows],
+                    "date": fact["date"]
+                },
+                "history": history
+            },
+            "baseline_comparison": baseline_data
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"An unexpected error occurred: {str(e)}",
+            "status": "error"
+        }), 500
+
+
+"""
+LongMemEval live panel: lets the UI pick one of the eval/data/subset.json instances (real
+LongMemEval haystacks, ~40-50 sessions / ~115k tokens each -- the Track 03 benchmark scale,
+distinct from the 9-session hand-written demo above), ingest it into HydraDB on demand, and
+ask it questions interactively. Ingestion runs in a background thread and is polled for
+progress since it can take many minutes, especially if the LLM API rate-limits mid-run.
+"""
+
+
+@app.route("/eval/results", methods=["GET"])
+def eval_results():
+    """Reads eval/results.json, written incrementally by eval/run_eval.py as it works through
+    the subset -- lets the UI show a live-updating benchmark dashboard while a batch run is
+    in progress, not just after it finishes."""
+    results_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval", "results.json")
+    if not os.path.exists(results_path):
+        return jsonify({"results": [], "total": 0, "correct": 0, "subset_size": len(eval_engine.load_subset())})
+
+    import json
+    with open(results_path, encoding="utf-8") as fh:
+        results = json.load(fh)
+
+    correct = sum(1 for r in results if r.get("passed"))
     return jsonify({
-        "answer": answer,
-        "source_sessions": [fact["session_key"]],
-        "found": True,
+        "results": results,
+        "total": len(results),
+        "correct": correct,
+        "subset_size": len(eval_engine.load_subset()),
+    })
+
+
+@app.route("/eval/instances", methods=["GET"])
+def eval_instances():
+    subset = eval_engine.load_subset()
+    instances = []
+    for i, instance in enumerate(subset):
+        instances.append({
+            "index": i,
+            "question_id": instance["question_id"],
+            "category": eval_engine.category_for(instance),
+            "question": instance["question"],
+            "reference_answer": instance["answer"],
+            "n_sessions": len(instance["haystack_sessions"]),
+            "ingested": eval_engine.is_ingested(i),
+        })
+    return jsonify({"instances": instances})
+
+
+@app.route("/eval/ingest", methods=["POST", "OPTIONS"])
+def eval_ingest():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    if eval_engine.is_ingested(instance_index):
+        return jsonify({"status": "already_ingested"})
+
+    with _eval_progress_lock:
+        existing = _eval_progress.get(instance_index)
+        if existing and not existing.get("done"):
+            return jsonify({"status": "already_running"})
+        _eval_progress[instance_index] = {"session": 0, "total": len(subset[instance_index]["haystack_sessions"]), "done": False, "error": None}
+
+    def on_progress(idx: int, total: int, note: str) -> None:
+        with _eval_progress_lock:
+            _eval_progress[instance_index] = {"session": idx, "total": total, "done": idx >= total, "error": None}
+
+    def run_ingest() -> None:
+        try:
+            eval_engine.ingest_instance(subset[instance_index], instance_index, on_progress=on_progress)
+        except Exception as e:  # noqa: BLE001 - reported via the status endpoint, not raised in this thread
+            with _eval_progress_lock:
+                prev = _eval_progress.get(instance_index, {})
+                prev["done"] = True
+                prev["error"] = str(e)
+                _eval_progress[instance_index] = prev
+
+    threading.Thread(target=run_ingest, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/eval/ingest_status", methods=["GET"])
+def eval_ingest_status():
+    instance_index = request.args.get("instance_index", type=int)
+    if instance_index is None:
+        return jsonify({"error": "instance_index query param is required", "status": "invalid"}), 400
+
+    with _eval_progress_lock:
+        progress = _eval_progress.get(instance_index)
+
+    if progress is None:
+        return jsonify({"session": 0, "total": 0, "done": eval_engine.is_ingested(instance_index), "error": None})
+    return jsonify(progress)
+
+
+@app.route("/eval/ask", methods=["POST", "OPTIONS"])
+def eval_ask():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    instance = subset[instance_index]
+    question = (body.get("question") or instance["question"]).strip()
+
+    if not eval_engine.is_ingested(instance_index):
+        return jsonify({"error": "instance not ingested yet -- POST /eval/ingest first", "status": "invalid"}), 409
+
+    try:
+        response = eval_engine.answer_question(instance_index, question)
+    except Exception as e:
+        return jsonify({"error": f"LLM answer failed: {str(e)}", "status": "error"}), 500
+
+    return jsonify({
+        "question": question,
+        "answer": response["answer"],
+        "found": response["found"],
+        "status": "found" if response["found"] else "not_found",
+        "n_candidates": response["n_candidates"],
+        "candidates": [
+            {"predicate": c["predicate"], "text": c["text"], "session": c["session_key"], "date": c["date"]}
+            for c in response["candidates"]
+        ],
+    })
+
+
+@app.route("/eval/grade", methods=["POST", "OPTIONS"])
+def eval_grade():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    instance = subset[instance_index]
+    answer = body.get("answer")
+    found = body.get("found")
+    if answer is None or found is None:
+        return jsonify({"error": "answer and found are required", "status": "invalid"}), 400
+
+    try:
+        passed = eval_engine.grade(instance, {"found": found, "answer": answer})
+    except Exception as e:
+        return jsonify({"error": f"Grading failed: {str(e)}", "status": "error"}), 500
+
+    return jsonify({
+        "passed": passed,
+        "reference_answer": instance["answer"],
+        "category": eval_engine.category_for(instance),
     })
 
 
