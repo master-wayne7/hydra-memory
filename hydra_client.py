@@ -21,7 +21,7 @@ written against it (see README for detail):
 """
 
 import os
-
+import time
 import requests
 from dotenv import load_dotenv
 
@@ -38,22 +38,39 @@ _QUERY_URL = f"{HTTP_URL}/v1/graphs/{GRAPH}/query"
 
 def run(query: str, **parameters) -> list[dict]:
     """Run a Cypher query against HydraDB, return rows as list of {column: value} dicts."""
-    resp = requests.post(
-        _QUERY_URL,
-        headers={
-            "Authorization": f"Bearer {AUTH_TOKEN}",
-            "X-Graph-Namespace": NAMESPACE,
-            "Content-Type": "application/json",
-        },
-        json={"cell_id": CELL_ID, "query": query, "parameters": parameters},
-        timeout=30,
-    )
-    body = resp.json()
-    if "error" in body:
-        raise RuntimeError(f"HydraDB query failed: {body['error']['message']}\nquery: {query}\nparameters: {parameters}")
+    # Introduce a small pacing delay before mutation queries to prevent write locks/concurrency issues
+    if any(keyword in query for keyword in ("MERGE", "SET", "CREATE")):
+        time.sleep(0.35)
 
-    columns = body["columns"]
-    rows = []
-    for raw_row in body["rows"]:
-        rows.append({col: cell.get("value") for col, cell in zip(columns, raw_row)})
-    return rows
+    last_err = None
+    for attempt in range(5):
+        try:
+            resp = requests.post(
+                _QUERY_URL,
+                headers={
+                    "Authorization": f"Bearer {AUTH_TOKEN}",
+                    "X-Graph-Namespace": NAMESPACE,
+                    "Content-Type": "application/json",
+                },
+                json={"cell_id": CELL_ID, "query": query, "parameters": parameters},
+                timeout=30,
+            )
+            body = resp.json()
+        except requests.exceptions.RequestException as e:
+            # Transient network/timeout error -- worth retrying.
+            last_err = e
+            time.sleep(1.0 + attempt * 0.5)
+            continue
+
+        if "error" in body:
+            # The server understood the request and rejected the query itself (bad
+            # Cypher, unsupported pattern, etc.) -- retrying would just fail identically.
+            raise RuntimeError(f"HydraDB query failed: {body['error']['message']}\nquery: {query}\nparameters: {parameters}")
+
+        columns = body["columns"]
+        rows = []
+        for raw_row in body["rows"]:
+            rows.append({col: cell.get("value") for col, cell in zip(columns, raw_row)})
+        return rows
+
+    raise last_err
