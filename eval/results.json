@@ -1,0 +1,82 @@
+[
+  {
+    "question_id": "6a1eabeb",
+    "category": "knowledge-update",
+    "question": "What was my personal best time in the charity 5K run?",
+    "reference_answer": "25 minutes and 50 seconds (or 25:50)",
+    "our_answer": "25:50",
+    "our_found": true,
+    "n_candidates": 33,
+    "passed": true
+  },
+  {
+    "question_id": "6aeb4375",
+    "category": "knowledge-update",
+    "question": "How many Korean restaurants have I tried in my city?",
+    "reference_answer": "four",
+    "our_answer": "four",
+    "our_found": true,
+    "n_candidates": 41,
+    "passed": true
+  },
+  {
+    "question_id": "830ce83f",
+    "category": "knowledge-update",
+    "question": "Where did Rachel move to after her recent relocation?",
+    "reference_answer": "the suburbs",
+    "our_answer": "the suburbs",
+    "our_found": true,
+    "n_candidates": 32,
+    "passed": true
+  },
+  {
+    "question_id": "852ce960",
+    "category": "knowledge-update",
+    "question": "What was the amount I was pre-approved for when I got my mortgage from Wells Fargo?",
+    "reference_answer": "$400,000",
+    "our_answer": "$350,000",
+    "our_found": true,
+    "n_candidates": 24,
+    "passed": false
+  },
+  {
+    "question_id": "0862e8bf_abs",
+    "category": "abstention",
+    "question": "What is the name of my hamster?",
+    "reference_answer": "You did not mention this information. You mentioned your cat Luna but not your hamster.",
+    "our_answer": "not found",
+    "our_found": false,
+    "n_candidates": 31,
+    "passed": true
+  },
+  {
+    "question_id": "15745da0_abs",
+    "category": "abstention",
+    "question": "How long have I been collecting vintage films?",
+    "reference_answer": "You did not mention this information. You mentioned collecting vintage cameras but not vintage films.",
+    "our_answer": "not found",
+    "our_found": false,
+    "n_candidates": 45,
+    "passed": true
+  },
+  {
+    "question_id": "bc8a6e93_abs",
+    "category": "abstention",
+    "question": "What did I bake for my uncle's birthday party?",
+    "reference_answer": "You did not mention this information. You mentioned baking for your niece's birthday party but not your uncle's",
+    "our_answer": "not found",
+    "our_found": false,
+    "n_candidates": 40,
+    "passed": true
+  },
+  {
+    "question_id": "19b5f2b3_abs",
+    "category": "abstention",
+    "question": "How long was I in Korea for?",
+    "reference_answer": "You did not mention this information. You mentioned staying in Japan, but not in Korea.",
+    "our_answer": "not found",
+    "our_found": false,
+    "n_candidates": 37,
+    "passed": true
+  }
+]

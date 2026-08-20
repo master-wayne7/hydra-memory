@@ -56,16 +56,21 @@ def run(query: str, **parameters) -> list[dict]:
                 timeout=30,
             )
             body = resp.json()
-            if "error" in body:
-                raise RuntimeError(f"HydraDB query failed: {body['error']['message']}\nquery: {query}\nparameters: {parameters}")
-
-            columns = body["columns"]
-            rows = []
-            for raw_row in body["rows"]:
-                rows.append({col: cell.get("value") for col, cell in zip(columns, raw_row)})
-            return rows
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
+            # Transient network/timeout error -- worth retrying.
             last_err = e
             time.sleep(1.0 + attempt * 0.5)
+            continue
+
+        if "error" in body:
+            # The server understood the request and rejected the query itself (bad
+            # Cypher, unsupported pattern, etc.) -- retrying would just fail identically.
+            raise RuntimeError(f"HydraDB query failed: {body['error']['message']}\nquery: {query}\nparameters: {parameters}")
+
+        columns = body["columns"]
+        rows = []
+        for raw_row in body["rows"]:
+            rows.append({col: cell.get("value") for col, cell in zip(columns, raw_row)})
+        return rows
 
     raise last_err

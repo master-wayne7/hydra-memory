@@ -26,16 +26,26 @@ import llm_client as llm
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "sessions.json")
 
-EXTRACT_SYSTEM = f"""You extract factual statements about the user or other mentioned entities from a chat session transcript.
-Respond with ONLY a JSON object of this exact shape:
-{{"facts": [{{"subject": "user", "predicate": "...", "object": "<short value>", "text": "<one sentence stating the fact>"}}]}}
+EXTRACT_SYSTEM = f"""You extract factual statements about the user from what the user explicitly stated in a chat session.
+Respond with ONLY a JSON object:
+{{"facts": [{{"subject": "user", "predicate": "...", "object": "exact value", "text": "one clear factual sentence"}}]}}
 The predicate field MUST be exactly one of these six values: {", ".join(llm.PREDICATES)}.
-Do not invent other predicates. Ignore anything in the transcript that does not clearly match one of these six concepts.
-IMPORTANT:
-- Distinguish between facts about the user (use subject "user") and facts about other people/entities (use their relationship or name as the subject, e.g., "brother" or "friend").
-- Do NOT attribute third-party facts to the user (e.g., "My brother lives in Bangalore" is about the brother, not the user).
-- Only extract current facts. Do NOT extract historical facts (e.g., "I used to live in Delhi") as current facts.
-- If nothing in the transcript matches these criteria, return exactly {{"facts": []}}."""
+Do not invent other predicates. Ignore anything that does not clearly match one of these six concepts.
+
+Rules:
+- NEVER use angle brackets like <...> or placeholder words.
+- Distinguish between facts about the user (subject "user") and other people (use their relationship, e.g. "brother").
+- Only extract current facts. Do NOT extract historical facts ("I used to live in...") as current.
+- If nothing in the transcript matches, return {{"facts": []}}.
+
+Example:
+User: I moved to Pune. I am now working at Zomato as a Senior Software Engineer.
+Output:
+{{"facts": [
+  {{"subject": "user", "predicate": "lives_in", "object": "Pune", "text": "The user lives in Pune."}},
+  {{"subject": "user", "predicate": "works_at", "object": "Zomato", "text": "The user works at Zomato."}},
+  {{"subject": "user", "predicate": "job_title", "object": "Senior Software Engineer", "text": "The user is a Senior Software Engineer."}}
+]}}"""
 
 _next_id_counter = 0
 
@@ -59,13 +69,14 @@ def next_id() -> int:
 
 
 def transcript_for(session: dict) -> str:
-    lines = [f"{m['role']}: {m['text']}" for m in session["messages"]]
-    return "Transcript:\n" + "\n".join(lines)
+    user_lines = [f"User: {m['text']}" for m in session["messages"] if m.get("role") == "user"]
+    return "\n".join(user_lines)
+
 
 
 def extract_facts(session: dict) -> list[dict]:
     try:
-        result = llm.chat_json(EXTRACT_SYSTEM, transcript_for(session))
+        result = llm.chat_json(EXTRACT_SYSTEM, transcript_for(session), schema=llm.FACTS_SCHEMA)
         if not isinstance(result, dict):
             print(f"  [WARNING] Expected JSON dict from LLM, got: {type(result)}")
             return []
@@ -90,24 +101,35 @@ def get_current_fact(subject: str, predicate: str) -> Optional[dict]:
         )
         return rows[0] if rows else None
 
-    if len(rows) == 1:
-        return rows[0]
+    # A single current fact can have multiple STATED_IN edges (one per session that
+    # restated the same value via provenance merging) -- that's not a duplicate-fact
+    # condition, so group rows by fact id before deciding whether repair is needed.
+    by_id: dict = {}
+    for row in rows:
+        fid = row["id"]
+        best = by_id.get(fid)
+        if best is None or (row.get("index") or 0) > (best.get("index") or 0):
+            by_id[fid] = row
+    facts = list(by_id.values())
 
-    # Multiple current facts! Self-healing/repair logic.
+    if len(facts) == 1:
+        return facts[0]
+
+    # Multiple distinct current facts! Self-healing/repair logic.
     print(f"  [WARNING] Multiple current facts found for {subject}.{predicate}! Repairing...")
     # Sort descending by session index, then timestamp (or ID as final tie breaker)
-    sorted_rows = sorted(
-        rows,
+    sorted_facts = sorted(
+        facts,
         key=lambda r: (r.get("index") or 0, r.get("timestamp") or "", r["id"]),
         reverse=True
     )
-    newest = sorted_rows[0]
-    
+    newest = sorted_facts[0]
+
     # Mark others as current = false
-    for row in sorted_rows[1:]:
+    for row in sorted_facts[1:]:
         print(f"    healing: marking fact id {row['id']} (val: {row['object']}) as current=false")
         hc.run("MATCH (f:Fact {id: $fid}) SET f.current = false", fid=row["id"])
-        
+
     return newest
 
 
@@ -161,8 +183,13 @@ def ingest() -> None:
 
             subject = fact.get("subject", "user")
             raw_predicate = fact.get("predicate")
-            obj = fact.get("object")
-            text = fact.get("text", f"{subject} {raw_predicate} {obj}")
+            obj = str(fact.get("object", "")).strip()
+            if obj.startswith("<") and obj.endswith(">"):
+                obj = obj[1:-1].strip()
+            text = str(fact.get("text", f"{subject} {raw_predicate} {obj}")).strip()
+            if text.startswith("<") and text.endswith(">"):
+                text = text[1:-1].strip()
+
 
             # Apply semantic normalization
             predicate = llm.normalize_predicate(raw_predicate)
@@ -190,9 +217,7 @@ def ingest() -> None:
                 # Same value! Skip creating a new Fact node. Merge the STATED_IN relationship
                 # to the current Session node to record provenance.
                 hc.run(
-                    "MATCH (f:Fact {id: $fid}) "
-                    "MERGE (sess:Session {id: $sid, key: $skey, index: $idx, date: $date}) "
-                    "MERGE (f)-[:STATED_IN]->(sess)",
+                    "MERGE (f:Fact {id: $fid})-[:STATED_IN]->(sess:Session {id: $sid, key: $skey, index: $idx, date: $date})",
                     fid=existing_curr["id"], sid=sid, skey=skey, idx=session["index"], date=session["date"]
                 )
                 print(f"  skip duplicate restatement: {subject}.{predicate} = {obj} (merged provenance)")

@@ -200,6 +200,43 @@
     <button data-q="What is the user's favorite color?">Favorite color? (unanswerable)</button>
     <button data-q="What changed about the user recently?">What changed? (Diff)</button>
   </div>
+
+  <section style="margin-top: 48px; border-top: 1px solid var(--border); padding-top: 28px;">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+      <h1 style="font-size: 1.15rem;">Benchmark Results</h1>
+      <button id="results-refresh-btn" style="padding: 6px 12px; font-size: 0.8rem;">Refresh</button>
+    </div>
+    <p class="subtitle">Live results from <code>eval/run_eval.py</code> as it works through the subset &mdash;
+      updates automatically while a run is in progress.</p>
+
+    <div id="results-summary" style="margin-bottom: 16px; font-size: 0.9rem;"></div>
+    <div id="results-table" style="display: flex; flex-direction: column; gap: 8px;"></div>
+  </section>
+
+  <section style="margin-top: 48px; border-top: 1px solid var(--border); padding-top: 28px;">
+    <h1 style="font-size: 1.15rem;">LongMemEval Benchmark (Live)</h1>
+    <p class="subtitle">Real LongMemEval instances &mdash; 39-52 sessions, ~115k tokens each, the Track 03 benchmark
+      scale. Pick one, ingest it into HydraDB with open-vocabulary extraction, then ask it a question.</p>
+
+    <div id="eval-instance-list" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px;"></div>
+
+    <div id="eval-detail" class="card">
+      <div id="eval-detail-header" style="margin-bottom: 14px;"></div>
+      <div id="eval-ingest-row"></div>
+      <div id="eval-ask-row" style="display: none; gap: 8px; margin-top: 14px;">
+        <input type="text" id="eval-question" placeholder="Question for this instance" autocomplete="off"
+          style="flex: 1; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 0.9rem;">
+        <button id="eval-ask-btn">Ask</button>
+      </div>
+      <div id="eval-answer-section" style="display: none; margin-top: 16px; border-top: 1px solid var(--border); padding-top: 14px;">
+        <span class="status" id="eval-status-badge"></span>
+        <p class="answer" id="eval-answer-text"></p>
+        <div id="eval-candidates" style="margin-top: 12px; font-size: 0.82rem; color: var(--muted); line-height: 1.5;"></div>
+        <button id="eval-grade-btn" style="margin-top: 14px;">Check against reference</button>
+        <div id="eval-grade-result" style="margin-top: 10px; font-size: 0.85rem;"></div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -223,6 +260,11 @@
   const baselineHydra = document.getElementById("baseline-hydra");
   const baselineNaive = document.getElementById("baseline-naive");
   const baselineExpl = document.getElementById("baseline-expl");
+
+  const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
+  }
 
   async function ask(question) {
     submitBtn.disabled = true;
@@ -292,10 +334,10 @@
           itemDiv.style.padding = "10px 12px";
           itemDiv.style.fontSize = "0.9rem";
           
-          const chainText = c.history.join(" &rarr; ");
+          const chainText = c.history.map(escapeHtml).join(" &rarr; ");
           itemDiv.innerHTML = `
             <div>
-              <strong style="color: var(--muted); font-size: 0.75rem; text-transform: uppercase;">${c.predicate}</strong>
+              <strong style="color: var(--muted); font-size: 0.75rem; text-transform: uppercase;">${escapeHtml(c.predicate)}</strong>
               <div style="margin-top: 4px; font-weight: 500;">${chainText} <span style="color: var(--found); font-weight: bold; margin-left: 4px;">✓</span></div>
             </div>
           `;
@@ -325,12 +367,12 @@
           }
           
           // Join sessions if multiple exist
-          const sessText = Array.isArray(item.sessions) ? item.sessions.join(", ") : item.session;
-          
+          const sessText = escapeHtml(Array.isArray(item.sessions) ? item.sessions.join(", ") : item.session);
+
           itemDiv.innerHTML = `
             <div>
-              <strong style="color: ${item.current ? 'var(--found)' : 'var(--text)'}; font-size: 0.95rem;">${item.value}</strong>
-              <div style="font-size: 0.75rem; color: var(--muted); margin-top: 2px;">Session ${sessText} &middot; ${item.date}</div>
+              <strong style="color: ${item.current ? 'var(--found)' : 'var(--text)'}; font-size: 0.95rem;">${escapeHtml(item.value)}</strong>
+              <div style="font-size: 0.75rem; color: var(--muted); margin-top: 2px;">Session ${sessText} &middot; ${escapeHtml(item.date)}</div>
             </div>
             <span class="status ${item.current ? 'found' : 'notfound'}" style="font-size: 0.65rem; margin: 0;">${item.current ? 'current' : 'superseded'}</span>
           `;
@@ -355,7 +397,7 @@
         baselineSection.style.display = "block";
         baselineHydra.textContent = data.baseline_comparison.hydramemory;
         baselineNaive.textContent = data.baseline_comparison.baseline;
-        baselineExpl.innerHTML = `<strong>Why it matters:</strong> ${data.baseline_comparison.explanation}`;
+        baselineExpl.innerHTML = `<strong>Why it matters:</strong> ${escapeHtml(data.baseline_comparison.explanation)}`;
       }
 
       answerText.textContent = data.answer || "(no answer)";
@@ -390,6 +432,290 @@
       ask(btn.dataset.q);
     });
   });
+
+  // --- Benchmark results dashboard ---
+  const EVAL_BASE = API_URL.replace(/\/ask$/, "");
+  const resultsSummary = document.getElementById("results-summary");
+  const resultsTable = document.getElementById("results-table");
+  const resultsRefreshBtn = document.getElementById("results-refresh-btn");
+
+  function categoryColor(category) {
+    return category === "abstention" ? "var(--notfound)" : "var(--accent)";
+  }
+
+  async function loadResults() {
+    try {
+      const res = await fetch(`${EVAL_BASE}/eval/results`);
+      const data = await res.json();
+
+      if (data.total === 0) {
+        resultsSummary.innerHTML = `<span style="color: var(--muted);">No results yet -- run <code>python eval/run_eval.py</code> to populate this (subset has ${data.subset_size} instances).</span>`;
+        resultsTable.innerHTML = "";
+        return;
+      }
+
+      const pct = data.total ? Math.round((100 * data.correct) / data.total) : 0;
+      resultsSummary.innerHTML = `
+        <strong>${data.correct}/${data.total}</strong> correct (${pct}%)
+        <span style="color: var(--muted);"> &middot; ${data.total}/${data.subset_size} instances graded so far</span>
+      `;
+
+      resultsTable.innerHTML = "";
+      data.results.forEach((r) => {
+        const row = document.createElement("div");
+        row.style.border = "1px solid var(--border)";
+        row.style.borderRadius = "8px";
+        row.style.padding = "10px 12px";
+        row.style.background = "var(--panel)";
+
+        const passColor = r.passed ? "var(--found)" : "var(--notfound)";
+        const passLabel = r.passed ? "PASS" : "FAIL";
+        const body = r.error
+          ? `<span style="color: var(--notfound);">Error: ${escapeHtml(r.error)}</span>`
+          : `
+            <div style="margin-top: 4px;">Our answer: ${escapeHtml(r.our_answer)}</div>
+            <div style="color: var(--muted);">Reference: ${escapeHtml(r.reference_answer)}</div>
+          `;
+
+        row.innerHTML = `
+          <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px;">
+            <span>
+              <span style="color: ${categoryColor(r.category)}; font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">${escapeHtml(r.category)}</span>
+              <strong style="margin-left: 8px;">${escapeHtml(r.question)}</strong>
+            </span>
+            <span style="color: ${passColor}; font-weight: 700; font-size: 0.8rem; white-space: nowrap;">${passLabel}</span>
+          </div>
+          <div style="font-size: 0.85rem; margin-top: 4px;">${body}</div>
+        `;
+        resultsTable.appendChild(row);
+      });
+    } catch (err) {
+      resultsSummary.innerHTML = `<span style="color: var(--notfound);">Could not reach the API to load results.</span>`;
+    }
+  }
+
+  resultsRefreshBtn.addEventListener("click", loadResults);
+  loadResults();
+  setInterval(loadResults, 15000);
+
+  // --- LongMemEval live panel ---
+  const evalInstanceList = document.getElementById("eval-instance-list");
+  const evalDetail = document.getElementById("eval-detail");
+  const evalDetailHeader = document.getElementById("eval-detail-header");
+  const evalIngestRow = document.getElementById("eval-ingest-row");
+  const evalAskRow = document.getElementById("eval-ask-row");
+  const evalQuestionInput = document.getElementById("eval-question");
+  const evalAskBtn = document.getElementById("eval-ask-btn");
+  const evalAnswerSection = document.getElementById("eval-answer-section");
+  const evalStatusBadge = document.getElementById("eval-status-badge");
+  const evalAnswerText = document.getElementById("eval-answer-text");
+  const evalCandidates = document.getElementById("eval-candidates");
+  const evalGradeBtn = document.getElementById("eval-grade-btn");
+  const evalGradeResult = document.getElementById("eval-grade-result");
+
+  let evalInstances = [];
+  let selectedInstance = null;
+  let evalPollTimer = null;
+  let lastEvalAnswer = null; // { question, answer, found }
+
+  function categoryBadge(category) {
+    const color = category === "abstention" ? "var(--notfound)" : "var(--accent)";
+    return `<span style="color:${color}; font-size:0.7rem; font-weight:600; text-transform:uppercase; letter-spacing:0.03em;">${escapeHtml(category)}</span>`;
+  }
+
+  function renderEvalInstanceList() {
+    evalInstanceList.innerHTML = "";
+    evalInstances.forEach((inst) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.style.textAlign = "left";
+      row.style.background = inst.index === selectedInstance ? "rgba(91,141,239,0.12)" : "var(--panel)";
+      row.style.border = "1px solid " + (inst.index === selectedInstance ? "var(--accent)" : "var(--border)");
+      row.style.borderRadius = "8px";
+      row.style.padding = "10px 12px";
+      row.style.color = "var(--text)";
+      row.style.cursor = "pointer";
+      row.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span>${categoryBadge(inst.category)} <strong style="margin-left:8px;">${escapeHtml(inst.question)}</strong></span>
+          <span style="font-size:0.75rem; color:var(--muted); white-space:nowrap;">${inst.n_sessions} sessions ${inst.ingested ? "&middot; ingested" : ""}</span>
+        </div>
+      `;
+      row.addEventListener("click", () => selectInstance(inst.index));
+      evalInstanceList.appendChild(row);
+    });
+  }
+
+  function selectInstance(index) {
+    selectedInstance = index;
+    lastEvalAnswer = null;
+    renderEvalInstanceList();
+
+    const inst = evalInstances[index];
+    evalDetail.classList.add("visible");
+    evalDetailHeader.innerHTML = `
+      ${categoryBadge(inst.category)}
+      <p style="margin: 6px 0 0; font-size: 0.95rem;">${escapeHtml(inst.question)}</p>
+      <p style="margin: 4px 0 0; font-size: 0.75rem; color: var(--muted);">${inst.n_sessions} sessions in this haystack</p>
+    `;
+    evalAnswerSection.style.display = "none";
+    evalGradeResult.innerHTML = "";
+    evalQuestionInput.value = inst.question;
+
+    if (inst.ingested) {
+      evalIngestRow.innerHTML = `<span style="font-size:0.85rem; color:var(--found);">&#10003; Already ingested into HydraDB</span>`;
+      evalAskRow.style.display = "flex";
+    } else {
+      evalAskRow.style.display = "none";
+      evalIngestRow.innerHTML = "";
+      const btn = document.createElement("button");
+      btn.textContent = `Ingest (${inst.n_sessions} sessions)`;
+      btn.addEventListener("click", () => startIngest(index));
+      evalIngestRow.appendChild(btn);
+    }
+  }
+
+  async function startIngest(index) {
+    evalIngestRow.innerHTML = `<span style="font-size:0.85rem; color:var(--muted);">Starting ingestion...</span>`;
+    try {
+      const res = await fetch(`${EVAL_BASE}/eval/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance_index: index }),
+      });
+      const data = await res.json();
+      if (data.status === "already_ingested") {
+        evalInstances[index].ingested = true;
+        if (selectedInstance === index) selectInstance(index);
+        return;
+      }
+      pollIngestStatus(index);
+    } catch (err) {
+      evalIngestRow.innerHTML = `<span style="font-size:0.85rem; color:var(--notfound);">Could not reach the API to start ingestion.</span>`;
+    }
+  }
+
+  function pollIngestStatus(index) {
+    if (evalPollTimer) clearInterval(evalPollTimer);
+    evalPollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(`${EVAL_BASE}/eval/ingest_status?instance_index=${index}`);
+        const status = await res.json();
+        if (status.error) {
+          clearInterval(evalPollTimer);
+          evalIngestRow.innerHTML = `<span style="font-size:0.85rem; color:var(--notfound);">Ingestion failed: ${escapeHtml(status.error)}</span>`;
+          return;
+        }
+        if (selectedInstance === index) {
+          evalIngestRow.innerHTML = `<span style="font-size:0.85rem; color:var(--muted);">Ingesting session ${status.session}/${status.total}... (can take a while, especially if the LLM API is rate-limited)</span>`;
+        }
+        if (status.done) {
+          clearInterval(evalPollTimer);
+          evalInstances[index].ingested = true;
+          if (selectedInstance === index) selectInstance(index);
+        }
+      } catch (err) {
+        clearInterval(evalPollTimer);
+      }
+    }, 1500);
+  }
+
+  async function askEvalInstance() {
+    const index = selectedInstance;
+    const question = evalQuestionInput.value.trim();
+    if (index === null || !question) return;
+
+    evalAskBtn.disabled = true;
+    evalAskBtn.textContent = "Asking...";
+    try {
+      const res = await fetch(`${EVAL_BASE}/eval/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instance_index: index, question }),
+      });
+      const data = await res.json();
+      evalAnswerSection.style.display = "block";
+      evalGradeResult.innerHTML = "";
+
+      if (data.status === "found") {
+        evalStatusBadge.textContent = "found";
+        evalStatusBadge.className = "status found";
+      } else if (data.status === "error" || data.status === "invalid") {
+        evalStatusBadge.textContent = data.status;
+        evalStatusBadge.className = "status notfound";
+      } else {
+        evalStatusBadge.textContent = "not in memory";
+        evalStatusBadge.className = "status notfound";
+      }
+
+      evalAnswerText.textContent = data.answer || data.error || "(no answer)";
+      lastEvalAnswer = { question, answer: data.answer, found: !!data.found };
+
+      if (data.candidates && data.candidates.length) {
+        evalCandidates.innerHTML = "<strong>Graph-curated candidates considered:</strong><br>" +
+          data.candidates.map(c => `&bull; (${escapeHtml(c.predicate)}) ${escapeHtml(c.text)} <span style="opacity:0.7;">[${escapeHtml(c.session)}]</span>`).join("<br>");
+      } else {
+        evalCandidates.innerHTML = "<em>No current facts found for this instance.</em>";
+      }
+    } catch (err) {
+      evalAnswerSection.style.display = "block";
+      evalStatusBadge.textContent = "error";
+      evalStatusBadge.className = "status notfound";
+      evalAnswerText.textContent = "Could not reach the API.";
+      evalCandidates.innerHTML = "";
+      lastEvalAnswer = null;
+    } finally {
+      evalAskBtn.disabled = false;
+      evalAskBtn.textContent = "Ask";
+    }
+  }
+
+  evalAskBtn.addEventListener("click", askEvalInstance);
+  evalQuestionInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); askEvalInstance(); }
+  });
+
+  evalGradeBtn.addEventListener("click", async () => {
+    if (!lastEvalAnswer || selectedInstance === null) return;
+    evalGradeBtn.disabled = true;
+    try {
+      const res = await fetch(`${EVAL_BASE}/eval/grade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instance_index: selectedInstance,
+          question: lastEvalAnswer.question,
+          answer: lastEvalAnswer.answer,
+          found: lastEvalAnswer.found,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        evalGradeResult.innerHTML = `<span style="color:var(--notfound);">${escapeHtml(data.error)}</span>`;
+        return;
+      }
+      const color = data.passed ? "var(--found)" : "var(--notfound)";
+      evalGradeResult.innerHTML = `
+        <span style="color:${color}; font-weight:600;">${data.passed ? "PASS" : "FAIL"}</span>
+        &mdash; reference answer: <em>${escapeHtml(data.reference_answer)}</em>
+      `;
+    } catch (err) {
+      evalGradeResult.innerHTML = `<span style="color:var(--notfound);">Could not reach the API.</span>`;
+    } finally {
+      evalGradeBtn.disabled = false;
+    }
+  });
+
+  (async function loadEvalInstances() {
+    try {
+      const res = await fetch(`${EVAL_BASE}/eval/instances`);
+      const data = await res.json();
+      evalInstances = data.instances || [];
+      renderEvalInstanceList();
+    } catch (err) {
+      evalInstanceList.innerHTML = `<span style="font-size:0.85rem; color:var(--notfound);">Could not reach the API to load LongMemEval instances.</span>`;
+    }
+  })();
 </script>
 </body>
 </html>

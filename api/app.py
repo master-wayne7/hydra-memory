@@ -11,16 +11,24 @@ a question the graph doesn't have data for.
 
 import os
 import sys
+import threading
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, jsonify, request
 
+import eval.engine as eval_engine
 import hydra_client as hc
 import llm_client as llm
 
 app = Flask(__name__)
+
+# In-memory ingestion progress for the live LongMemEval panel, keyed by instance index.
+# A 40-50 session instance can take many minutes (more if the LLM API rate-limits), so
+# ingestion runs in a background thread and the UI polls /eval/ingest_status for progress.
+_eval_progress: dict[int, dict] = {}
+_eval_progress_lock = threading.Lock()
 
 
 @app.after_request
@@ -41,7 +49,18 @@ Respond with ONLY JSON: {{"subject": "user", "predicate": "..."}}
 The predicate field MUST be exactly one of these six values: {", ".join(llm.PREDICATES)},
 OR the literal string "none" if the question does not clearly match any of them."""
 
+QUESTION_PARSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string"},
+        "predicate": {"type": "string", "enum": llm.PREDICATES + ["none"]},
+    },
+    "required": ["subject", "predicate"],
+    "additionalProperties": False,
+}
+
 ANSWER_SYSTEM = "You answer a question using ONLY the single fact given to you. Respond with one concise, natural sentence. Do not add any information beyond what's given."
+
 
 NOT_FOUND_ANSWER = "I don't have that in memory."
 
@@ -238,8 +257,9 @@ def ask():
 
         # LLM question parsing
         try:
-            parsed = llm.chat_json(QUESTION_PARSE_SYSTEM, question)
+            parsed = llm.chat_json(QUESTION_PARSE_SYSTEM, question, schema=QUESTION_PARSE_SCHEMA)
             print(f"The answer:{parsed}")
+
         except Exception as e:
             return jsonify({
                 "error": f"LLM question parsing failed: {str(e)}",
@@ -381,6 +401,170 @@ def ask():
             "error": f"An unexpected error occurred: {str(e)}",
             "status": "error"
         }), 500
+
+
+"""
+LongMemEval live panel: lets the UI pick one of the eval/data/subset.json instances (real
+LongMemEval haystacks, ~40-50 sessions / ~115k tokens each -- the Track 03 benchmark scale,
+distinct from the 9-session hand-written demo above), ingest it into HydraDB on demand, and
+ask it questions interactively. Ingestion runs in a background thread and is polled for
+progress since it can take many minutes, especially if the LLM API rate-limits mid-run.
+"""
+
+
+@app.route("/eval/results", methods=["GET"])
+def eval_results():
+    """Reads eval/results.json, written incrementally by eval/run_eval.py as it works through
+    the subset -- lets the UI show a live-updating benchmark dashboard while a batch run is
+    in progress, not just after it finishes."""
+    results_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval", "results.json")
+    if not os.path.exists(results_path):
+        return jsonify({"results": [], "total": 0, "correct": 0, "subset_size": len(eval_engine.load_subset())})
+
+    import json
+    with open(results_path, encoding="utf-8") as fh:
+        results = json.load(fh)
+
+    correct = sum(1 for r in results if r.get("passed"))
+    return jsonify({
+        "results": results,
+        "total": len(results),
+        "correct": correct,
+        "subset_size": len(eval_engine.load_subset()),
+    })
+
+
+@app.route("/eval/instances", methods=["GET"])
+def eval_instances():
+    subset = eval_engine.load_subset()
+    instances = []
+    for i, instance in enumerate(subset):
+        instances.append({
+            "index": i,
+            "question_id": instance["question_id"],
+            "category": eval_engine.category_for(instance),
+            "question": instance["question"],
+            "reference_answer": instance["answer"],
+            "n_sessions": len(instance["haystack_sessions"]),
+            "ingested": eval_engine.is_ingested(i),
+        })
+    return jsonify({"instances": instances})
+
+
+@app.route("/eval/ingest", methods=["POST", "OPTIONS"])
+def eval_ingest():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    if eval_engine.is_ingested(instance_index):
+        return jsonify({"status": "already_ingested"})
+
+    with _eval_progress_lock:
+        existing = _eval_progress.get(instance_index)
+        if existing and not existing.get("done"):
+            return jsonify({"status": "already_running"})
+        _eval_progress[instance_index] = {"session": 0, "total": len(subset[instance_index]["haystack_sessions"]), "done": False, "error": None}
+
+    def on_progress(idx: int, total: int, note: str) -> None:
+        with _eval_progress_lock:
+            _eval_progress[instance_index] = {"session": idx, "total": total, "done": idx >= total, "error": None}
+
+    def run_ingest() -> None:
+        try:
+            eval_engine.ingest_instance(subset[instance_index], instance_index, on_progress=on_progress)
+        except Exception as e:  # noqa: BLE001 - reported via the status endpoint, not raised in this thread
+            with _eval_progress_lock:
+                prev = _eval_progress.get(instance_index, {})
+                prev["done"] = True
+                prev["error"] = str(e)
+                _eval_progress[instance_index] = prev
+
+    threading.Thread(target=run_ingest, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/eval/ingest_status", methods=["GET"])
+def eval_ingest_status():
+    instance_index = request.args.get("instance_index", type=int)
+    if instance_index is None:
+        return jsonify({"error": "instance_index query param is required", "status": "invalid"}), 400
+
+    with _eval_progress_lock:
+        progress = _eval_progress.get(instance_index)
+
+    if progress is None:
+        return jsonify({"session": 0, "total": 0, "done": eval_engine.is_ingested(instance_index), "error": None})
+    return jsonify(progress)
+
+
+@app.route("/eval/ask", methods=["POST", "OPTIONS"])
+def eval_ask():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    instance = subset[instance_index]
+    question = (body.get("question") or instance["question"]).strip()
+
+    if not eval_engine.is_ingested(instance_index):
+        return jsonify({"error": "instance not ingested yet -- POST /eval/ingest first", "status": "invalid"}), 409
+
+    try:
+        response = eval_engine.answer_question(instance_index, question)
+    except Exception as e:
+        return jsonify({"error": f"LLM answer failed: {str(e)}", "status": "error"}), 500
+
+    return jsonify({
+        "question": question,
+        "answer": response["answer"],
+        "found": response["found"],
+        "status": "found" if response["found"] else "not_found",
+        "n_candidates": response["n_candidates"],
+        "candidates": [
+            {"predicate": c["predicate"], "text": c["text"], "session": c["session_key"], "date": c["date"]}
+            for c in response["candidates"]
+        ],
+    })
+
+
+@app.route("/eval/grade", methods=["POST", "OPTIONS"])
+def eval_grade():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    body = request.get_json(force=True, silent=True) or {}
+    instance_index = body.get("instance_index")
+    subset = eval_engine.load_subset()
+    if not isinstance(instance_index, int) or not (0 <= instance_index < len(subset)):
+        return jsonify({"error": "instance_index must be a valid subset index", "status": "invalid"}), 400
+
+    instance = subset[instance_index]
+    answer = body.get("answer")
+    found = body.get("found")
+    if answer is None or found is None:
+        return jsonify({"error": "answer and found are required", "status": "invalid"}), 400
+
+    try:
+        passed = eval_engine.grade(instance, {"found": found, "answer": answer})
+    except Exception as e:
+        return jsonify({"error": f"Grading failed: {str(e)}", "status": "error"}), 500
+
+    return jsonify({
+        "passed": passed,
+        "reference_answer": instance["answer"],
+        "category": eval_engine.category_for(instance),
+    })
 
 
 if __name__ == "__main__":
